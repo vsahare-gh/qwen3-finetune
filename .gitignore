@@ -1,0 +1,20 @@
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# macOS
+.DS_Store
+
+# Training data and generated artifacts
+data/
+adapters/
+runs/
+
+# 3GPP source and extracted documents
+3gpp_specs/
