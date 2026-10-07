@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--max-seq-length", type=int, default=512)
+    parser.add_argument("--max-steps", type=int, default=None, help="Optional training-step cap for pilot runs or continuation from a checkpoint.")
+    parser.add_argument("--save-every", type=int, default=1000, help="Save an MLX adapter checkpoint every N steps (default: 500).")
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--qa-eval", default=None, help="Optional expert-authored QA JSONL for post-training response latency and answer review.")
@@ -521,7 +523,7 @@ def write_performance_template(path: Path, run_data: dict) -> None:
         writer.writerow({"parameter": "Training duration / final iteration / trained tokens", "actual": f"{run_data.get('elapsed_seconds', 'Not captured')} sec / {run_data.get('final_iteration', 'Not captured')} / {run_data.get('trained_tokens', 'Not captured')}", "target": "Compare runs on the same device and dataset.", "how_to_measure": "Wall-clock duration plus final MLX progress row.", "why_it_matters": "Shows total run cost and confirms training progress.", "business_impact": "Helps estimate future fine-tuning time.", "status": "Captured" if run_data.get("elapsed_seconds") is not None else "Not captured"})
 
 
-def load_qa_eval(path: Path) -> list[dict]:
+def load_qa_eval(path: Path ) -> list[dict]:
     if not path.is_file():
         raise SystemExit(f"QA evaluation file not found: {path}")
     rows = []
@@ -734,8 +736,10 @@ def train(args: argparse.Namespace) -> None:
     config = CORPORA[args.corpus]
     output_dir = config["data_dir"]
     run_name = config["run_name"]
-    if args.batch_size < 1 or args.num_layers < 1 or args.max_seq_length < 1:
-        raise SystemExit("batch-size, num-layers, and max-seq-length must be positive integers.")
+    if args.batch_size < 1 or args.num_layers < 1 or args.max_seq_length < 1 or args.save_every < 1:
+        raise SystemExit("batch-size, num-layers, max-seq-length, and save-every must be positive integers.")
+    if args.max_steps is not None and args.max_steps < 1:
+        raise SystemExit("max-steps must be a positive integer when provided.")
 
     if args.qa_generation_tokens < 1:
         raise SystemExit("qa-generation-tokens must be positive.")
@@ -768,7 +772,8 @@ def train(args: argparse.Namespace) -> None:
             f"Train rows ({train_rows}) must be divisible by batch-size ({args.batch_size}) "
             "to guarantee one complete pass without dropping a partial batch."
         )
-    iters = train_rows // args.batch_size
+    full_epoch_iters = train_rows // args.batch_size
+    iters = min(full_epoch_iters, args.max_steps) if args.max_steps is not None else full_epoch_iters
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     adapter_path = Path(args.adapter_path) if args.adapter_path else ROOT / "adapters" / f"qwen3-1.7b-{run_name}-full-{run_id}"
@@ -793,12 +798,19 @@ def train(args: argparse.Namespace) -> None:
         "--data", str(training_data_dir), "--adapter-path", str(adapter_path),
         "--batch-size", str(args.batch_size), "--num-layers", str(args.num_layers),
         "--max-seq-length", str(args.max_seq_length), "--learning-rate", str(args.learning_rate),
-        "--grad-checkpoint", "--iters", str(iters), "--save-every", "5000",
+        "--grad-checkpoint", "--iters", str(iters), "--save-every", str(args.save_every),
         "--steps-per-report", "100", "--steps-per-eval", "1000",
         "--val-batches", "25", "--seed", str(args.seed),
     ]
     if resume_adapter_file:
         command.extend(["--resume-adapter-file", str(resume_adapter_file)])
+    training_notes = (
+        f"Training is capped at {iters} optimizer steps out of {full_epoch_iters} for this dataset."
+        if iters < full_epoch_iters
+        else "Each train.jsonl row is scheduled once in this epoch."
+    )
+    if resume_adapter_file:
+        training_notes += " Resume loads adapter weights only; MLX-LM restarts optimizer state and batch ordering, so this is not an exact process-state resume."
     manifest = {
         "run_id": run_id,
         "corpus": args.corpus,
@@ -807,12 +819,16 @@ def train(args: argparse.Namespace) -> None:
         "model": args.model,
         "adapter_path": str(adapter_path),
         "resume_adapter_file": str(resume_adapter_file) if resume_adapter_file else None,
+        "resume_mode": "adapter_weights_only" if resume_adapter_file else None,
         "data_dir": str(train_data_path.parent),
         "training_dataset_type": "chat_qa" if args.qa_train else "document_chunks",
         "training_dataset_file": str(train_data_path),
         "dataset_rows": counts,
         "dataset_sha256": hashes,
-        "epochs_requested": 1,
+        "epochs_requested": round(iters / full_epoch_iters, 6),
+        "full_epoch_steps": full_epoch_iters,
+        "max_steps": args.max_steps,
+        "save_every_steps": args.save_every,
         "steps_requested": iters,
         "batch_size": args.batch_size,
         "max_seq_length_tokens": args.max_seq_length,
@@ -822,10 +838,14 @@ def train(args: argparse.Namespace) -> None:
         "python_version": sys.version,
         "platform": platform.platform(),
         "command": command,
-        "notes": f"Each train.jsonl row is scheduled once in this epoch; examples are tokenized/truncated to max_seq_length_tokens. This training-only run uses a train-only data directory, so validation and test evaluation are deferred. Corpus: {args.corpus}.",
+        "notes": f"{training_notes} Examples are tokenized/truncated to max_seq_length_tokens. This training-only run uses a train-only data directory, so validation and test evaluation are deferred. Corpus: {args.corpus}.",
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"Training one epoch: {train_rows} rows, batch size {args.batch_size}, {iters} optimizer iterations.")
+    if iters == full_epoch_iters:
+        print(f"Training one epoch: {train_rows} rows, batch size {args.batch_size}, {iters} optimizer iterations.")
+    else:
+        print(f"Training pilot/continuation: up to {iters} optimizer iterations from {train_rows} rows (full epoch: {full_epoch_iters}).")
+    print(f"Adapter checkpoints every {args.save_every} iterations.")
     print(f"Adapter: {adapter_path}")
     print(f"Run artifacts: {run_dir}")
     print("Note: rows longer than max-seq-length are truncated by MLX-LM for training.")
